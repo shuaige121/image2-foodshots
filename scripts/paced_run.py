@@ -53,19 +53,18 @@ log(f"=== start: {len(work)} of {REPS*len(base)} ===")
 i = 0
 while i < len(work):
     chunk = work[i:i+CHUNK]
-    lid = acquire_lease(f"{len(chunk)} img -> {os.path.basename(OUT)}")
-    try:
-        wait_clear()
-        jf = f"{OUT}/_chunk.jsonl"
-        open(jf, "w").write("\n".join(json.dumps(c) for c in chunk) + "\n")
-        log(f"chunk {i//CHUNK+1}: {[c['name'] for c in chunk]}")
-        r = subprocess.run(["python3", IMG2, "--jobs", jf, "--out-dir", OUT, "--size", "square 1024x1024",
-                            "--quality", "high", "--timeout", "480", "--concurrency", "3"], capture_output=True, text=True)
-        if '"auth_errors": 0' not in (r.stdout or "") and '"auth_errors"' in (r.stdout or ""):
-            log("  ⛔ dead Codex token detected — stopping; run `codex login`"); release_lease(lid); break
-        log(f"  done; pngs now {len([x for x in os.listdir(OUT) if x.endswith('.png')])}")
-    finally:
-        release_lease(lid)
+    # NOTE: paced_run no longer claims the lease itself. image2.py now self-claims the
+    # cross-device mutex AND heartbeats it for the whole batch, so it's the single lease
+    # authority — no nested lease, no TTL-expiry-mid-chunk gap. We only pace the cooldown here.
+    wait_clear()
+    jf = f"{OUT}/_chunk.jsonl"
+    open(jf, "w").write("\n".join(json.dumps(c) for c in chunk) + "\n")
+    log(f"chunk {i//CHUNK+1}: {[c['name'] for c in chunk]}")
+    r = subprocess.run(["python3", IMG2, "--jobs", jf, "--out-dir", OUT, "--size", "square 1024x1024",
+                        "--quality", "high", "--timeout", "480", "--concurrency", "3"], capture_output=True, text=True)
+    if '"auth_errors": 0' not in (r.stdout or "") and '"auth_errors"' in (r.stdout or ""):
+        log("  ⛔ dead Codex token detected — stopping; run `codex login`"); break
+    log(f"  done; pngs now {len([x for x in os.listdir(OUT) if x.endswith('.png')])}")
     i += CHUNK
 log("=== COMPLETE ===")
 print("DONE", len([x for x in os.listdir(OUT) if x.endswith('.png')]))

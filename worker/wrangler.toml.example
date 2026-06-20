@@ -6,6 +6,12 @@ compatibility_date = "2026-06-01"
 binding = "KV"
 id = "<YOUR_KV_NAMESPACE_ID>"
 
+# R2 bucket = transient image staging (NAS puller pulls + acks, then it's pruned).
+# Create once:  wrangler r2 bucket create img2-store
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "img2-store"
+
 [vars]
 COOLDOWN_THRESHOLD = "12"
 COOLDOWN_WINDOW_MIN = "40"

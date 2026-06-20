@@ -11,3 +11,4 @@ auth.json
 image2-counter.json
 *.token
 *counter*.json
+worker/wrangler.toml

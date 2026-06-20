@@ -270,6 +270,91 @@ def cooldown_line() -> str | None:
     return f"cooldown gate: clear ({st.get('recent_in_window')}/{st.get('threshold')} in last {st.get('window_min')}min)"
 
 
+import base64
+import threading
+import atexit
+
+# ---------- generation lease (cross-device mutex) + R2 image staging ----------
+_LEASE = {"id": None, "owned": False, "stop": None}
+
+
+def lease_acquire(task: str, ttl: int = 900, wait_max: int = 1200) -> None:
+    """Claim the single cross-device generation lease BEFORE a batch, so two devices never
+    race the rotating OAuth refresh token. If another device holds it, wait (up to wait_max).
+    If a parent (paced_run) already holds this device's lease, inherit it WITHOUT owning, so
+    we never release someone else's in-flight lease. Best-effort: no counter -> no-op."""
+    cfg = _counter_cfg()
+    if not cfg:
+        return
+    held = os.environ.get("IMAGE2_LEASE_HELD")  # parent passed its lease -> don't re-claim/release
+    if held:
+        _LEASE["id"], _LEASE["owned"] = held, False
+        return
+    dev = cfg.get("device", "unknown")
+    waited = 0
+    while True:
+        r = _counter_call("POST", "/claim", {"device": dev, "task": task[:120], "ttl": ttl})
+        if r is None:
+            return  # coordinator unreachable -> proceed uncoordinated (don't block real work)
+        if r.get("granted"):
+            _LEASE["id"] = r.get("lease_id")
+            _LEASE["owned"] = not r.get("inherited")  # only release a lease we actually created
+            if _LEASE["owned"]:
+                _lease_start_heartbeat(ttl)
+            return
+        wait = min(20, max(5, int(r.get("wait_sec", 15))))
+        if waited >= wait_max:
+            log(f"  ⚠ waited {waited}s for the generation lease (held by {r.get('holder')}); proceeding")
+            return
+        log(f"  ⏳ generation lease held by {r.get('holder')} ({r.get('task', '')}) — waiting {wait}s")
+        time.sleep(wait)
+        waited += wait
+
+
+def _lease_start_heartbeat(ttl: int) -> None:
+    stop = threading.Event()
+    _LEASE["stop"] = stop
+
+    def beat():
+        while not stop.wait(max(30, ttl // 3)):
+            if not _LEASE["id"]:
+                return
+            _counter_call("POST", "/heartbeat", {"lease_id": _LEASE["id"], "ttl": ttl})
+
+    threading.Thread(target=beat, daemon=True).start()
+
+
+def lease_release() -> None:
+    if _LEASE.get("stop"):
+        _LEASE["stop"].set()
+    if _LEASE.get("owned") and _LEASE.get("id"):
+        _counter_call("POST", "/release", {"lease_id": _LEASE["id"]})
+    _LEASE["id"], _LEASE["owned"], _LEASE["stop"] = None, False, None
+
+
+atexit.register(lease_release)  # release on crash / SIGINT too (best-effort)
+
+
+def upload_image(path: str, name: str, thread_id: str | None, prompt: str) -> None:
+    """Stage one PNG into R2 via the worker (best-effort). The NAS puller archives it to the
+    NAS and acks, after which the worker prunes the R2 copy (delete-after-ack)."""
+    cfg = _counter_cfg()
+    if not cfg:
+        return
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return
+    _counter_call("POST", "/upload", {
+        "device": cfg.get("device", "unknown"),
+        "thread_id": thread_id or "x",
+        "name": name,
+        "prompt": prompt[:2000],
+        "date": time.strftime("%Y-%m-%d"),
+        "png_b64": base64.b64encode(data).decode(),
+    })
+
+
 def format_usage(rl: dict | None) -> str:
     if not rl:
         return "usage: (no rate-limit data found yet)"
@@ -478,6 +563,8 @@ def do_job(job: dict, args) -> dict:
                 saved.append(str(dest))
             result.update(ok=True, files=saved)
             cooldown_event(len(saved))  # record into shared cooldown window (best-effort)
+            for sp in saved:  # stage each PNG into R2 for the NAS puller to archive (best-effort)
+                upload_image(sp, Path(sp).stem, thread_id, spec)
             log(f"  ✔ {name} -> {', '.join(saved)}  ({time.time()-t0:.0f}s)")
             return result
         log(f"  ✘ {name} attempt {attempt} produced no image ({time.time()-t0:.0f}s)"
@@ -578,10 +665,14 @@ def main() -> None:
 
     t0 = time.time()
     results: list[dict] = []
-    with cf.ThreadPoolExecutor(max_workers=conc) as ex:
-        futs = [ex.submit(do_job, j, args) for j in jobs]
-        for fut in cf.as_completed(futs):
-            results.append(fut.result())
+    lease_acquire(f"{len(jobs)} img -> {Path(args.out_dir).name}")  # cross-device mutex before generating
+    try:
+        with cf.ThreadPoolExecutor(max_workers=conc) as ex:
+            futs = [ex.submit(do_job, j, args) for j in jobs]
+            for fut in cf.as_completed(futs):
+                results.append(fut.result())
+    finally:
+        lease_release()  # release on success, failure, or abort
 
     ok = [r for r in results if r["ok"]]
     bad = [r for r in results if not r["ok"]]
